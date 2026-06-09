@@ -20,6 +20,7 @@ output for tracing, and silencing of noisy third-party loggers.
 """
 
 import logging
+import os
 import sys
 
 import structlog
@@ -27,6 +28,16 @@ import structlog
 from sandbox.configs.run_config import RunConfig
 
 config = RunConfig.get_instance_sync()
+
+# Root log level, overridable via the SANDBOX_LOG_LEVEL env var (e.g. DEBUG,
+# INFO, WARNING, ERROR, CRITICAL). Defaults to INFO to avoid logging every
+# code-execution request, which is extremely verbose under RL rollouts. Set it
+# to OFF/NONE/DISABLE (or any level above CRITICAL) to silence all logging.
+_level_name = os.environ.get('SANDBOX_LOG_LEVEL', 'INFO').upper()
+if _level_name in ('OFF', 'NONE', 'DISABLE', 'DISABLED', 'SILENT'):
+    LOG_LEVEL = logging.CRITICAL + 1
+else:
+    LOG_LEVEL = getattr(logging, _level_name, logging.INFO)
 
 
 def configure_logging(trace_file=None):
@@ -70,7 +81,7 @@ def configure_logging(trace_file=None):
     handlers = []
 
     stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.setLevel(LOG_LEVEL)
     stdout_handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processors=[filter_keys, structlog.dev.ConsoleRenderer(colors=config.common.logging_color)],))
@@ -84,8 +95,18 @@ def configure_logging(trace_file=None):
                                                             structlog.processors.JSONRenderer()],))
         handlers.append(file_handler)
 
-    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
+    logging.basicConfig(level=LOG_LEVEL, handlers=handlers)
     logging.getLogger('aiosqlite').setLevel(logging.CRITICAL)
     logging.getLogger('databases').setLevel(logging.CRITICAL)
     logging.getLogger("uvicorn.access").handlers = []
     logging.getLogger("uvicorn.access").propagate = False
+
+    # When logging is fully disabled, also gag uvicorn's own startup loggers,
+    # which configure independent handlers and otherwise ignore the root level.
+    if LOG_LEVEL > logging.CRITICAL:
+        logging.disable(logging.CRITICAL)
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+            uvicorn_logger = logging.getLogger(name)
+            uvicorn_logger.handlers = []
+            uvicorn_logger.propagate = False
+            uvicorn_logger.setLevel(LOG_LEVEL)

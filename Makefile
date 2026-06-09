@@ -4,6 +4,7 @@ TEST_NP ?= 16
 IMAGE_TAG ?= 25042026-2
 BACKEND ?= docker
 MODE ?= full
+SANDBOX_LOG_LEVEL ?= OFF
 run:
 	uvicorn sandbox.server.server:app --reload --host $(HOST) --port $(PORT)
 
@@ -34,6 +35,7 @@ start-apptainer-container:
 	apptainer run --cleanenv --fakeroot --no-home \
 		--env PORT=$(PORT) \
 		--env SANDBOX_CONFIG=docker_bindroot \
+		--env SANDBOX_LOG_LEVEL=OFF \
 		-B $(CURDIR)/sandbox:/root/sandbox/sandbox \
 		"$$WORK/sandbox-fusion-server_$(IMAGE_TAG).sif"
 
