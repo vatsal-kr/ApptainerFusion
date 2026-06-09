@@ -56,10 +56,13 @@ class RunConfig(BaseModel):
 
         Attributes
         ----------
-        isolation : ``"lite"`` | ``"full"``
+        isolation : ``"lite"`` | ``"full"`` | ``"bindroot"``
             ``"lite"`` -- handcrafted overlayfs + chroot + cgroups isolation,
             fast (< 100 ms overhead).
             ``"full"`` -- Docker container isolation with resource limits.
+            ``"bindroot"`` -- recursive bind-mount of ``/`` + per-exec
+            tmpfs scratch + chroot.  Apptainer-compatible alternative to
+            ``"lite"`` for hosts where overlay-on-rootfs is unavailable.
         max_concurrency : int
             Maximum number of sandbox instances that may run in parallel.
             Set to ``0`` to disable the internal concurrency limiter (useful
@@ -79,7 +82,7 @@ class RunConfig(BaseModel):
             (Docker) isolation mode to account for container startup
             latency.  Has no effect in lite mode.
         """
-        isolation: Literal['lite', 'full']
+        isolation: Literal['lite', 'full', 'bindroot']
         max_concurrency: int
         docker_image: str = 'ineil77/sandbox-fusion-server:25042026-2'
         default_memory_limit_mb: int = 8192

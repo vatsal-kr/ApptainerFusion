@@ -13,34 +13,62 @@
 # limitations under the License.
 """Pytest configuration hooks for the SandboxFusion test suite.
 
-Tests always run against a real server inside a Docker container,
-mirroring production.  The ``--sandbox-docker`` option (required)
-selects the isolation backend:
+Tests always run against a real server inside a container, mirroring
+production.  Two backends are supported:
 
-* ``full`` — Docker-in-Docker via the host Docker socket.
-* ``lite`` — privileged container with overlayfs + chroot + cgroups.
+* ``docker``    — ``docker run`` of the published image.
+* ``apptainer`` — ``apptainer run`` of a local ``.sif`` image (useful on
+                  HPC systems where Docker is not available).
+
+The ``--sandbox-backend`` option selects the runtime; ``--sandbox-mode``
+selects the isolation profile inside the container (``full``, ``lite``,
+or ``bindroot``).
 """
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 
 import pytest
 
+# Docker state
 _container_name: str | None = None
+
+# Apptainer state
+_apptainer_proc: subprocess.Popen | None = None
+_apptainer_log_path: str | None = None
+
+# Shared state (used by full mode regardless of backend)
 _workdir: str | None = None
+
+_DEFAULT_IMAGE_TAG = '25042026-2'
+_DEFAULT_DOCKER_IMAGE = f'ineil77/sandbox-fusion-server:{_DEFAULT_IMAGE_TAG}'
+_DEFAULT_SIF_NAME = f'sandbox-fusion-server_{_DEFAULT_IMAGE_TAG}.sif'
 
 
 def pytest_addoption(parser):
     parser.addoption(
-        '--sandbox-docker',
+        '--sandbox-backend',
+        action='store',
+        default=None,
+        choices=['docker', 'apptainer'],
+        help='Container runtime to launch the sandbox server with: '
+             '"docker" or "apptainer". Defaults to $SANDBOX_TEST_BACKEND '
+             'or "docker".',
+    )
+    parser.addoption(
+        '--sandbox-mode',
         action='store',
         default=None,
         metavar='MODE',
-        help='Start the sandbox server in a Docker container before tests. '
-             'MODE is the isolation backend: "lite" or "full". Required.',
+        help='Sandbox isolation profile: "lite", "full", or "bindroot". '
+             '"bindroot" is the apptainer-compatible alternative to "lite" '
+             'and is the only lite-style mode that works inside apptainer. '
+             'Required when launching a server (i.e. when '
+             'SANDBOX_TEST_SERVER_URL is unset).',
     )
 
 
@@ -49,20 +77,58 @@ def _is_xdist_worker(config) -> bool:
 
 
 def pytest_configure(config):
-    docker_mode = config.getoption('--sandbox-docker', default=None)
-    if docker_mode is None and os.environ.get('SANDBOX_TEST_DOCKER'):
-        docker_mode = os.environ['SANDBOX_TEST_DOCKER']
+    if _is_xdist_worker(config):
+        return
 
-    if docker_mode and not _is_xdist_worker(config):
-        _start_docker_server(docker_mode)
-    elif not _is_xdist_worker(config) and not os.environ.get('SANDBOX_TEST_SERVER_URL'):
+    mode = config.getoption('--sandbox-mode', default=None) \
+        or os.environ.get('SANDBOX_TEST_MODE') \
+        or os.environ.get('SANDBOX_TEST_DOCKER')  # legacy alias
+
+    backend = config.getoption('--sandbox-backend', default=None) \
+        or os.environ.get('SANDBOX_TEST_BACKEND') \
+        or 'docker'
+
+    if mode:
+        if backend == 'docker':
+            _start_docker_server(mode)
+        elif backend == 'apptainer':
+            _start_apptainer_server(mode)
+        else:
+            raise pytest.UsageError(f'Unknown --sandbox-backend: {backend!r}')
+    elif not os.environ.get('SANDBOX_TEST_SERVER_URL'):
         raise pytest.UsageError(
-            'Tests require --sandbox-docker full or --sandbox-docker lite.')
+            'Tests require --sandbox-mode full or --sandbox-mode lite '
+            '(optionally with --sandbox-backend docker|apptainer).')
 
 
 def pytest_unconfigure(config):
-    if not _is_xdist_worker(config):
-        _stop_docker_server()
+    if _is_xdist_worker(config):
+        return
+    _stop_docker_server()
+    _stop_apptainer_server()
+
+
+def _mode_resources(mode: str) -> tuple[str, str]:
+    if mode == 'full':
+        return '16g', '8'
+    if mode in ('lite', 'bindroot'):
+        return '256g', '128'
+    raise ValueError(
+        f'--sandbox-mode must be "lite", "bindroot", or "full", got {mode!r}')
+
+
+def _publish_url(url: str, mode: str):
+    os.environ['SANDBOX_TEST_SERVER_URL'] = url
+    os.environ['SANDBOX_ISOLATION_MODE'] = mode
+
+    from sandbox.tests import client as client_mod
+    import httpx
+    client_mod.client = httpx.Client(base_url=url, timeout=120)
+
+
+# ---------------------------------------------------------------------------
+# Docker backend
+# ---------------------------------------------------------------------------
 
 
 def _start_docker_server(mode: str):
@@ -70,17 +136,9 @@ def _start_docker_server(mode: str):
     import secrets
     _container_name = f'sandbox_test_{secrets.token_hex(4)}'
 
-    image = 'ineil77/sandbox-fusion-server:25042026-2'
+    image = os.environ.get('SANDBOX_TEST_IMAGE', _DEFAULT_DOCKER_IMAGE)
     port = int(os.environ.get('SANDBOX_TEST_PORT', '18080'))
-
-    if mode == 'full':
-        container_memory = '16g'
-        container_cpus = '8'
-    elif mode == 'lite':
-        container_memory = '256g'
-        container_cpus = '128'
-    else:
-        raise ValueError(f'--sandbox-docker must be "lite" or "full", got {mode!r}')
+    container_memory, container_cpus = _mode_resources(mode)
 
     cmd = [
         'docker', 'run', '-d',
@@ -100,40 +158,21 @@ def _start_docker_server(mode: str):
             '-e', f'SANDBOX_TMP_DIR={_workdir}',
             '-e', 'SANDBOX_CONFIG=docker_full',
         ]
-    elif mode == 'lite':
+    else:  # lite or bindroot
+        sandbox_config = 'docker_bindroot' if mode == 'bindroot' else 'docker_lite'
         cmd += [
             '--privileged',
-            '-e', 'SANDBOX_CONFIG=docker_lite',
+            '-e', f'SANDBOX_CONFIG={sandbox_config}',
         ]
     cmd.append(image)
 
-    print(f'\n--- Starting sandbox server container ({mode} mode): {_container_name} ---')
+    print(f'\n--- Starting sandbox server container ({mode} mode, docker): {_container_name} ---')
     subprocess.run(cmd, check=True, timeout=30)
 
     url = f'http://localhost:{port}'
-    os.environ['SANDBOX_TEST_SERVER_URL'] = url
-    os.environ['SANDBOX_ISOLATION_MODE'] = mode
-
-    from sandbox.tests import client as client_mod
-    import httpx
-    client_mod.client = httpx.Client(base_url=url, timeout=120)
-
+    _publish_url(url, mode)
     _wait_for_server(url, timeout=120)
     print(f'--- Server ready at {url} ---\n')
-
-
-def _wait_for_server(url: str, timeout: float):
-    import httpx
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            r = httpx.get(f'{url}/v1/ping', timeout=5)
-            if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(2)
-    raise TimeoutError(f'Sandbox server at {url} did not become healthy within {timeout}s')
 
 
 def _stop_docker_server():
@@ -144,10 +183,7 @@ def _stop_docker_server():
     _container_name = None
     print(f'\n--- Stopping sandbox server container: {name} ---')
     try:
-        subprocess.run(
-            ['docker', 'logs', '--tail', '50', name],
-            timeout=10,
-        )
+        subprocess.run(['docker', 'logs', '--tail', '50', name], timeout=10)
     except Exception:
         pass
     try:
@@ -162,3 +198,182 @@ def _stop_docker_server():
     if _workdir and os.path.isdir(_workdir):
         shutil.rmtree(_workdir, ignore_errors=True)
         _workdir = None
+
+
+# ---------------------------------------------------------------------------
+# Apptainer backend
+# ---------------------------------------------------------------------------
+
+
+def _resolve_sif_path() -> str:
+    sif = os.environ.get('SANDBOX_APPTAINER_SIF')
+    if sif:
+        return sif
+    base = os.environ.get('WORK')
+    if not base:
+        raise RuntimeError(
+            'Apptainer backend requires either SANDBOX_APPTAINER_SIF or '
+            '$WORK to be set (image expected at $WORK/' + _DEFAULT_SIF_NAME + ').')
+    return os.path.join(base, _DEFAULT_SIF_NAME)
+
+
+def _start_apptainer_server(mode: str):
+    global _apptainer_proc, _apptainer_log_path, _workdir
+
+    sif = _resolve_sif_path()
+    if not os.path.isfile(sif):
+        raise FileNotFoundError(
+            f'Apptainer image not found at {sif!r}. Pull it with:\n'
+            f'  apptainer pull docker://ineil77/sandbox-fusion-base:{_DEFAULT_IMAGE_TAG}\n'
+            f'  apptainer pull docker://ineil77/sandbox-fusion-server:{_DEFAULT_IMAGE_TAG}')
+
+    # Validate the mode early (same set as docker backend).
+    _mode_resources(mode)
+
+    port = int(os.environ.get('SANDBOX_TEST_PORT', '18080'))
+
+    # --cleanenv is essential: without it apptainer inherits the host's
+    # environment, and if the launching shell has an activated conda env
+    # its compiler toolchain vars (CC/CXX/CPP/LD/AS/AR=x86_64-conda-linux-gnu-*)
+    # leak into every sandboxed compile.  go's cgo, D's dmd, and swift's
+    # linker then try to invoke x86_64-conda-linux-gnu-cc, which exists only
+    # in the host conda env and not in the SIF, so those compiles fail.
+    # Docker starts from a clean env and is unaffected; --cleanenv makes
+    # apptainer match that.  PORT/SANDBOX_CONFIG are re-injected via --env.
+    cmd = ['apptainer', 'run', '--cleanenv', '--fakeroot', '--no-home']
+    # The server reads PORT from its env (see scripts/run.sh). Apptainer
+    # shares the host network namespace, so this binds on the host port.
+    cmd += ['--env', f'PORT={port}']
+
+    if mode == 'full':
+        _workdir = tempfile.mkdtemp(prefix='sandbox_work_')
+        os.chmod(_workdir, 0o777)
+        if not os.path.exists('/var/run/docker.sock'):
+            raise RuntimeError(
+                '--sandbox-mode full requires /var/run/docker.sock on the host '
+                '(the sandbox spawns sibling docker containers). On '
+                'apptainer-only hosts use --sandbox-mode bindroot.')
+        cmd += [
+            '-B', '/var/run/docker.sock:/var/run/docker.sock',
+            '-B', f'{_workdir}:{_workdir}',
+            '--env', f'SANDBOX_TMP_DIR={_workdir}',
+            '--env', 'SANDBOX_CONFIG=docker_full',
+        ]
+    elif mode == 'bindroot':
+        # Apptainer-compatible lite-equivalent.  Uses bind mounts in place
+        # of overlay, which is the only lite-style mode that works inside
+        # apptainer (overlay-on-overlay is rejected by the kernel).
+        # Bind the host sandbox/ over the SIF's copy so local edits are
+        # picked up without rebuilding the image.
+        host_sandbox = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sandbox')
+        cmd += [
+            '-B', f'{host_sandbox}:/root/sandbox/sandbox',
+            '--env', 'SANDBOX_CONFIG=docker_bindroot',
+        ]
+    else:  # lite
+        # Note: lite mode fails inside apptainer (overlay-on-rootfs is
+        # rejected with 'failed to clone lowerpath').  Use bindroot
+        # instead.  We still expose lite here for parity with docker.
+        cmd += ['--env', 'SANDBOX_CONFIG=docker_lite']
+
+    cmd.append(sif)
+
+    _apptainer_log_path = os.path.join(
+        tempfile.gettempdir(), f'sandbox_apptainer_{os.getpid()}.log')
+    log_file = open(_apptainer_log_path, 'w')
+
+    print(f'\n--- Starting sandbox server ({mode} mode, apptainer): {sif} ---')
+    print(f'--- Container log: {_apptainer_log_path} ---')
+    _apptainer_proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    url = f'http://localhost:{port}'
+    _publish_url(url, mode)
+    try:
+        _wait_for_server(url, timeout=180, watch_proc=_apptainer_proc,
+                         log_path=_apptainer_log_path)
+    except Exception:
+        _stop_apptainer_server()
+        raise
+    print(f'--- Server ready at {url} ---\n')
+
+
+def _stop_apptainer_server():
+    global _apptainer_proc, _apptainer_log_path, _workdir
+    if _apptainer_proc is None:
+        return
+    proc = _apptainer_proc
+    _apptainer_proc = None
+    log_path = _apptainer_log_path
+    _apptainer_log_path = None
+
+    print('\n--- Stopping sandbox apptainer server ---')
+    if log_path and os.path.isfile(log_path):
+        try:
+            with open(log_path) as f:
+                tail = f.readlines()[-50:]
+            for line in tail:
+                print(line, end='')
+        except Exception:
+            pass
+
+    if proc.poll() is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            pgid = None
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    proc.kill()
+                proc.wait(timeout=5)
+        except ProcessLookupError:
+            pass
+
+    if _workdir and os.path.isdir(_workdir):
+        shutil.rmtree(_workdir, ignore_errors=True)
+        _workdir = None
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_server(url: str, timeout: float,
+                     watch_proc: subprocess.Popen | None = None,
+                     log_path: str | None = None):
+    import httpx
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if watch_proc is not None and watch_proc.poll() is not None:
+            tail = ''
+            if log_path and os.path.isfile(log_path):
+                try:
+                    with open(log_path) as f:
+                        tail = ''.join(f.readlines()[-40:])
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f'Sandbox server process exited early with code '
+                f'{watch_proc.returncode}.\n{tail}')
+        try:
+            r = httpx.get(f'{url}/v1/ping', timeout=5)
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(f'Sandbox server at {url} did not become healthy within {timeout}s')

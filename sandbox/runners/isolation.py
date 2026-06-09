@@ -15,11 +15,16 @@
 
 This module provides async context managers and helper functions that set up
 and tear down the OS-level isolation layers used when
-``RunConfig.sandbox.isolation == 'lite'``:
+``RunConfig.sandbox.isolation == 'lite'`` (overlay-based) or
+``RunConfig.sandbox.isolation == 'bindroot'`` (bind-mount-based, for hosts
+where overlay-on-rootfs is unavailable such as inside apptainer):
 
 * **Filesystem isolation** -- :func:`tmp_overlayfs` creates an overlayfs whose
   lower layer is the host root (``/``), with a tmpfs-backed upper layer so all
-  writes are ephemeral.
+  writes are ephemeral.  :func:`tmp_bindroot` is the apptainer-compatible
+  fallback: it recursively bind-mounts ``/`` into a temp dir, layers fresh
+  tmpfs over ``/tmp`` / ``/var/tmp`` / ``/run``, and re-exposes the caller's
+  cwd inside the new ``/tmp``.
 * **Resource limits** -- :func:`tmp_cgroup` creates cgroup v1 or v2 controllers
   (auto-detected) for memory and/or CPU quota.
 * **Network isolation** -- :func:`tmp_netns` creates a dedicated network
@@ -52,14 +57,22 @@ from sandbox.utils.common import random_cgroup_name
 
 logger = structlog.stdlib.get_logger()
 
+# Fixed in-chroot path where bindroot exposes a host-backed scratch directory
+# for compiler temp objects.  run_commands points $TMPDIR here; build_bindroot_wrapper
+# bind-mounts the per-exec host dir onto it.  Lives under /tmp (which stays a
+# tmpfs) but is itself a stable xfs bind -- see build_bindroot_wrapper for why.
+OBJ_TMPDIR = '/tmp/.sandbox_obj'
+
 # ---------------------------------------------------------------------------
 # Orphan tracking and cleanup
 # ---------------------------------------------------------------------------
-# Every overlay directory created by this process is tracked here so that
-# signal handlers can clean up on SIGTERM/SIGINT without needing the async
-# event loop.
+# Every overlay / bindroot directory created by this process is tracked here
+# so that signal handlers can clean up on SIGTERM/SIGINT without needing the
+# async event loop.
 _live_overlay_dirs: set[str] = set()
 _live_overlay_lock = threading.Lock()
+_live_bindroot_dirs: set[str] = set()
+_live_bindroot_lock = threading.Lock()
 
 
 def _sync_unmount_overlay(base_dir: str) -> None:
@@ -97,14 +110,50 @@ def _sync_unmount_overlay(base_dir: str) -> None:
         pass
 
 
+def _sync_unmount_bindroot(base_dir: str) -> None:
+    """Synchronously unmount a bindroot tree at *base_dir* and remove it.
+
+    bindroot is a recursive bind of '/' with scratch tmpfses on top, so a
+    single ``umount -Rl`` on the merged dir handles every nested mount.
+    Safe to call from signal handlers (uses only subprocess.run, no asyncio).
+    """
+    merged = f'{base_dir}/merged'
+    _subprocess.run(
+        ['sudo', 'umount', '-Rl', merged],
+        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL, timeout=15,
+    )
+    # Sweep anything still listed under base_dir (e.g. exposed-path binds
+    # mounted at unrelated paths inside merged).
+    try:
+        with open('/proc/mounts') as f:
+            mounts = [
+                line.split()[1] for line in f
+                if len(line.split()) >= 2 and (
+                    line.split()[1] == base_dir or
+                    line.split()[1].startswith(base_dir + '/'))
+            ]
+        for mp in sorted(mounts, key=len, reverse=True):
+            _subprocess.run(
+                ['sudo', 'umount', '-Rl', mp],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL, timeout=10,
+            )
+    except Exception:
+        pass
+    try:
+        shutil.rmtree(base_dir)
+    except Exception:
+        pass
+
+
 def cleanup_orphaned_sandboxes() -> int:
-    """Scan for and clean up orphaned overlay directories from prior crashes.
+    """Scan for and clean up orphaned overlay/bindroot directories from prior crashes.
 
-    Finds all ``/tmp/overlay_*`` directories, unmounts any active mounts
-    underneath them, and removes the directories.  Also cleans orphaned
-    cgroup directories and network namespaces with the ``sandbox_`` prefix.
+    Finds all ``/tmp/overlay_*`` and ``/tmp/bindroot_*`` directories,
+    unmounts any active mounts underneath them, and removes the
+    directories.  Also cleans orphaned cgroup directories and network
+    namespaces with the ``sandbox_``/``sbox_`` prefixes.
 
-    Returns the number of orphaned overlays cleaned.
+    Returns the total number of orphaned filesystem sandboxes cleaned.
     """
     cleaned = 0
 
@@ -121,6 +170,20 @@ def cleanup_orphaned_sandboxes() -> int:
             logger.info('cleaned orphaned overlay', path=d)
         except Exception as e:
             logger.warning('failed to clean orphaned overlay', path=d, error=str(e))
+
+    # --- Bindroot directories ---
+    for d in glob.glob('/tmp/bindroot_*'):
+        if not os.path.isdir(d):
+            continue
+        with _live_bindroot_lock:
+            if d in _live_bindroot_dirs:
+                continue
+        try:
+            _sync_unmount_bindroot(d)
+            cleaned += 1
+            logger.info('cleaned orphaned bindroot', path=d)
+        except Exception as e:
+            logger.warning('failed to clean orphaned bindroot', path=d, error=str(e))
 
     # --- Cgroup v2 orphans ---
     for d in glob.glob('/sys/fs/cgroup/sandbox_*'):
@@ -190,12 +253,19 @@ def cleanup_orphaned_sandboxes() -> int:
 
 
 def _signal_cleanup_handler(signum, frame):
-    """Signal handler that cleans up overlays owned by this process, then re-raises."""
+    """Signal handler that cleans up overlays/bindroots owned by this process, then re-raises."""
     with _live_overlay_lock:
-        dirs = list(_live_overlay_dirs)
-    for d in dirs:
+        overlay_dirs = list(_live_overlay_dirs)
+    for d in overlay_dirs:
         try:
             _sync_unmount_overlay(d)
+        except Exception:
+            pass
+    with _live_bindroot_lock:
+        bindroot_dirs = list(_live_bindroot_dirs)
+    for d in bindroot_dirs:
+        try:
+            _sync_unmount_bindroot(d)
         except Exception:
             pass
     signal.signal(signum, signal.SIG_DFL)
@@ -455,6 +525,165 @@ async def tmp_overlayfs():
 
         with _live_overlay_lock:
             _live_overlay_dirs.discard(base_dir)
+
+
+@asynccontextmanager
+async def tmp_bindroot():
+    """Async context manager that allocates a scratch dir for a bindroot chroot.
+
+    Designed for environments where overlay-on-rootfs is unavailable -- in
+    particular, apptainer, whose ``/`` is itself an overlay with locked
+    submounts (``/etc/hosts``, ``/etc/resolv.conf``, ``/.singularity.d/*``,
+    ``/dev/*``).  The kernel refuses to overlay such a directory
+    (``overlayfs: failed to clone lowerpath``), so :func:`tmp_overlayfs`
+    cannot be used.
+
+    Unlike :func:`tmp_overlayfs`, this context manager does **not** perform
+    the bind mounts itself.  On apptainer hosts that lack ``/etc/subuid``
+    entries (where the launcher falls back to LD_PRELOAD-based fakeroot),
+    the kernel sees the real uid for mount syscalls and rejects them with
+    ``EPERM`` regardless of fakeroot's ``uid=0`` illusion.  The workaround
+    is to do the mounts inside a nested ``unshare -U -m -r``, which gives
+    the caller real ``CAP_SYS_ADMIN`` in a fresh user+mount namespace.
+
+    Because the mounts must live in the same mount namespace as the
+    command being sandboxed, :func:`run_commands` wraps mount setup +
+    chroot + exec into a single ``unshare`` invocation.  This context
+    manager's only job is to allocate (and later remove) the empty
+    scratch base directory; the mount tree inside it vanishes
+    automatically when the unshared mount namespace dies.
+
+    Yields:
+        ``(base_dir, merged_dir)`` -- the host-side scratch path and the
+        chroot target that the caller should mount into.
+    """
+    base_dir = f'/tmp/bindroot_{random_cgroup_name()}'
+    merged_dir = f'{base_dir}/merged'
+
+    with _live_bindroot_lock:
+        _live_bindroot_dirs.add(base_dir)
+
+    try:
+        await aiofiles.os.makedirs(merged_dir)
+    except BaseException:
+        with _live_bindroot_lock:
+            _live_bindroot_dirs.discard(base_dir)
+        try:
+            await asyncio.to_thread(shutil.rmtree, base_dir)
+        except Exception:
+            pass
+        raise
+
+    try:
+        yield base_dir, merged_dir
+    finally:
+        # Best-effort sweep: under normal exit, the unshared mount
+        # namespace has died and there's nothing left to unmount.  But if
+        # an exception aborted the wrapper before its mount-setup ran to
+        # completion, stray mounts may linger -- defend against that.
+        remaining = await asyncio.to_thread(_read_mounts_under, base_dir)
+        if remaining:
+            try:
+                await execute_command(
+                    ['umount', '-Rl', merged_dir],
+                    raise_nonzero=False)
+            except Exception:
+                pass
+            await _sweep_remaining_mounts(base_dir)
+
+        try:
+            await asyncio.to_thread(shutil.rmtree, base_dir)
+        except Exception:
+            logger.warning('rmtree failed for bindroot dir', path=base_dir)
+
+        with _live_bindroot_lock:
+            _live_bindroot_dirs.discard(base_dir)
+
+
+def build_bindroot_wrapper(merged_dir: str, cwd: str) -> str:
+    """Return a bash snippet that sets up the bindroot mounts and chroots in.
+
+    Intended to be passed to ``unshare -U -m -r bash -c <snippet>`` (or
+    ``bash -c`` directly when the caller already has CAP_SYS_ADMIN).  The
+    snippet ends by ``exec``-ing chroot into *merged_dir* with the
+    inherited command, so callers should append ``"$@"`` semantics by
+    invoking the snippet via ``bash -c <snippet> _ <cmd...>``.
+
+    The snippet:
+      1. Recursively binds ``/`` into *merged_dir*.
+      2. Marks the bind tree private (so child mounts don't propagate
+         back).
+      3. Tmpfs's over ``/tmp``, ``/var/tmp``, ``/run``, and
+         ``/root/.cache`` for per-exec writable scratch (the SIF's
+         ``/root`` is read-only, so toolchain caches that hang off
+         ``$HOME/.cache`` need their own writable layer).
+      4. Re-binds the host *cwd* back into the new tree so the runner's
+         pre-staged files (and post-exec ``fetch_files``) survive the
+         tmpfs of step 3.
+      5. ``exec chroot`` -- the chroot inherits the unshared namespaces
+         and dies cleanly with all mounts.
+
+    Args:
+        merged_dir: Host path that will become the new ``/`` after chroot.
+        cwd: Absolute host path of the runner's working directory; rebind
+            into the chroot at the same absolute location so the inner
+            ``cd <cwd>`` works.
+
+    Returns:
+        A single bash snippet (newline-joined).  Errors abort via
+        ``set -e``.
+    """
+    abs_cwd = os.path.abspath(cwd)
+    # Host-backed per-exec scratch for compiler temp objects (sibling of
+    # ``merged`` under the bindroot base dir, so tmp_bindroot's rmtree cleans
+    # it up).  Exposed inside the chroot at OBJ_TMPDIR; see the note below.
+    tmp_scratch = os.path.join(os.path.dirname(merged_dir), 'tmproot')
+    return (
+        'set -e; '
+        # Detach this namespace's mount tree from the host's shared
+        # propagation groups before laying down per-exec mounts.  ``unshare
+        # -m`` copies the host mounts but leaves them as shared peers on hosts
+        # where '/' is rshared (e.g. systemd defaults under docker bindroot);
+        # a concurrent exec's mount could then propagate in and shadow ours
+        # mid-build.  (Apptainer's '/tmp' is already private, so this is a
+        # no-op there, but it is cheap and correct hygiene for shared roots.)
+        'mount --make-rprivate /; '
+        f'mount --rbind / {merged_dir}; '
+        f'mount --make-rprivate {merged_dir}; '
+        f'mount -t tmpfs tmpfs {merged_dir}/tmp; '
+        f'chmod 1777 {merged_dir}/tmp; '
+        # Compilers (gcc/g++/swiftc) write intermediate objects to $TMPDIR,
+        # which defaults to /tmp.  Under heavy mixed concurrency the chroot's
+        # tmpfs /tmp intermittently loses files written to it mid-build: the
+        # assembler writes ccXXXX.o and the linker then can't read it back
+        # ("ld: cannot find /tmp/ccXXXX.o: file format not recognized"),
+        # breaking ~4% of builds.  Give compilers a *host-backed* (xfs) scratch
+        # dir instead, which is stable.  It is mounted at a fixed path under
+        # /tmp (rather than over /tmp itself) so that /tmp stays a tmpfs: that
+        # device boundary is what keeps ``go test`` from treating the cwd as a
+        # throwaway temp module and ignoring its go.mod.  run_commands points
+        # TMPDIR here via OBJ_TMPDIR.
+        f'mkdir -p {tmp_scratch} {merged_dir}{OBJ_TMPDIR}; '
+        f'mount --bind {tmp_scratch} {merged_dir}{OBJ_TMPDIR}; '
+        f'chmod 1777 {merged_dir}{OBJ_TMPDIR}; '
+        f'mount -t tmpfs tmpfs {merged_dir}/var/tmp 2>/dev/null || true; '
+        f'mount -t tmpfs tmpfs {merged_dir}/run 2>/dev/null || true; '
+        # HOME for the sandboxed runtime is /root in the SIF; the SIF
+        # itself is read-only here, so language toolchains that scribble
+        # to $HOME/.cache (Go build cache, npm, etc.) fail with EROFS.
+        # Lay a tmpfs over /root/.cache to give them ephemeral scratch.
+        f'mount -t tmpfs tmpfs {merged_dir}/root/.cache 2>/dev/null || true; '
+        # Scala/sbt look up pre-resolved jars under /root/.cache/coursier
+        # at runtime (see run_scala in minor.py).  The tmpfs above hides
+        # them, so re-expose the SIF's coursier cache read-only on top.
+        # The original path is still visible via the outer mount NS since
+        # we used --rbind (not --move) above.
+        f'mkdir -p {merged_dir}/root/.cache/coursier; '
+        f'mount --bind /root/.cache/coursier {merged_dir}/root/.cache/coursier; '
+        f'mkdir -p {merged_dir}{abs_cwd}; '
+        f'mount --rbind {abs_cwd} {merged_dir}{abs_cwd}; '
+        f'exec chroot {merged_dir} "$@"'
+    )
 
 
 async def _wait_pid_exit(pid: str, label: str):

@@ -192,6 +192,10 @@ def test_isolation_network_server_localhost():
     assert result.status == RunStatus.Success
     assert 'Test Passed' in result.run_result.stdout
 
+@pytest.mark.skipif(
+    os.environ.get('SANDBOX_ISOLATION_MODE') == 'bindroot',
+    reason='Bindroot mode shares the host network namespace, so two servers '
+           'on the same port genuinely conflict (no per-exec netns).')
 async def test_isolation_network_server_port_conflict():
     """Verify that two concurrent servers on the same port do not conflict.
 

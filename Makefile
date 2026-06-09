@@ -1,6 +1,9 @@
 HOST ?= 0.0.0.0
 PORT ?= 8080
 TEST_NP ?= 16
+IMAGE_TAG ?= 25042026-2
+BACKEND ?= docker
+MODE ?= full
 run:
 	uvicorn sandbox.server.server:app --reload --host $(HOST) --port $(PORT)
 
@@ -14,21 +17,39 @@ install-runtimes:
 	cd runtime/lean && lake build
 
 build-base-image:
-	docker build . -f scripts/Dockerfile.base -t ineil77/sandbox-fusion-base:25042026-2
+	docker build . -f scripts/Dockerfile.base -t ineil77/sandbox-fusion-base:$(IMAGE_TAG)
 
 build-server-image:
-	docker build . -f scripts/Dockerfile.server -t ineil77/sandbox-fusion-server:25042026-2
+	docker build . -f scripts/Dockerfile.server -t ineil77/sandbox-fusion-server:$(IMAGE_TAG)
+
+pull-apptainer-images:
+	apptainer pull docker://ineil77/sandbox-fusion-base:$(IMAGE_TAG)
+	apptainer pull docker://ineil77/sandbox-fusion-server:$(IMAGE_TAG)
+
+# Launch a standalone apptainer server in bindroot mode for interactive use.
+# Binds the host sandbox/ directory over the SIF's copy so the latest local
+# code is picked up without rebuilding the image.  Drop the -B once the SIF
+# has been rebuilt with the new sources.
+start-apptainer-container:
+	apptainer run --cleanenv --fakeroot --no-home \
+		--env PORT=$(PORT) \
+		--env SANDBOX_CONFIG=docker_bindroot \
+		-B $(CURDIR)/sandbox:/root/sandbox/sandbox \
+		"$$WORK/sandbox-fusion-server_$(IMAGE_TAG).sif"
 
 test: test-docker-full
 
 test-docker-full:
-	pytest -m "not datalake" -n $(TEST_NP) --sandbox-docker full
+	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode full
 
 test-docker-lite:
-	pytest -m "not datalake" -n $(TEST_NP) --sandbox-docker lite
+	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode lite
+
+test-apptainer-bindroot:
+	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend apptainer --sandbox-mode bindroot
 
 test-case:
-	pytest -s -vv -k $(CASE) --sandbox-docker $(MODE)
+	pytest -s -vv -k $(CASE) --sandbox-backend $(BACKEND) --sandbox-mode $(MODE)
 
 format:
 	pycln --config pyproject.toml

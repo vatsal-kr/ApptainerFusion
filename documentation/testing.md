@@ -1,11 +1,11 @@
 # Testing Guide
 
-SandboxFusion ships with 217 tests across 35 test files. Every test runs against a real server inside a Docker container, mirroring production exactly. There is no in-process or mock mode.
+SandboxFusion ships with 217 tests across 35 test files. Every test runs against a real server inside a container, mirroring production exactly. Two container runtimes are supported (Docker and Apptainer); there is no in-process or mock mode.
 
 ## Quick Start
 
 ```bash
-# One-time: build the Docker images
+# One-time: build the Docker images (or pull as Apptainer SIFs -- see below)
 make build-base-image       # ~20 min first time (installs 20+ language runtimes)
 make build-server-image     # ~1 min (layers the app on top)
 
@@ -14,24 +14,93 @@ make test
 
 # Run all tests in lite (overlayfs + cgroups) isolation mode
 make test-docker-lite
+
+# Run all tests using Apptainer instead of Docker (HPC / rootless hosts)
+make pull-apptainer-images          # one-time: pull SIFs into the cwd
+make test-apptainer-full            # or: test-apptainer-bindroot
 ```
+
+> **Apptainer note:** the `lite` profile (overlayfs) does **not** work
+> inside apptainer because apptainer's `/` is itself an overlay with
+> locked submounts, which the kernel refuses to re-overlay (`overlayfs:
+> failed to clone lowerpath`). Use `bindroot` instead — it provides the
+> same per-exec cgroup + netns + chroot isolation but uses bind-mounts
+> in place of overlay. See "Isolation modes" below.
 
 ## How It Works
 
 The test harness is driven by a root-level `conftest.py` that hooks into pytest's lifecycle:
 
-1. **`pytest_configure`** -- starts a Docker container running the SandboxFusion server.
+1. **`pytest_configure`** -- starts a container running the SandboxFusion server.
 2. **Tests execute** -- each test sends HTTP requests to the container via `httpx`.
-3. **`pytest_unconfigure`** -- stops and removes the container, cleans up temp directories.
+3. **`pytest_unconfigure`** -- stops the container and cleans up temp directories.
 
-The `--sandbox-docker` flag selects the isolation mode:
+Two flags drive container startup:
 
 ```
-pytest --sandbox-docker full    # Docker-in-Docker (sibling containers)
-pytest --sandbox-docker lite    # overlayfs + cgroups inside a privileged container
+pytest --sandbox-backend docker|apptainer            # container runtime (default: docker)
+pytest --sandbox-mode full|lite|bindroot             # isolation profile inside the container
 ```
 
-This flag is required. Running `pytest` without it raises a `UsageError`.
+`--sandbox-mode` is required (unless `SANDBOX_TEST_SERVER_URL` is already set, pointing at a server you started yourself). Running `pytest` without it raises a `UsageError`.
+
+### Isolation modes
+
+| Mode | Filesystem | Memory/CPU | Network | Works on |
+|------|------------|-----------|---------|----------|
+| `full` | Docker container per exec | `docker run --memory --cpus` | `--network none` per exec | Docker |
+| `lite` | overlayfs over `/` | cgroup v1/v2 per exec | netns + veth + NAT per exec | Docker `--privileged` |
+| `bindroot` | recursive bind of `/` (inside `unshare -U -m -r`) + per-exec tmpfs over `/tmp` `/var/tmp` `/run`; cwd rebind | none (host kernel rejects cgroup mutation without subuid) | shared with host (no per-exec netns) | **apptainer**, Docker `--privileged` |
+
+`bindroot` was added specifically so apptainer-only hosts can run a
+lite-style fast path even when the launching user has no `/etc/subuid`
+mapping (the common HPC setup, where apptainer falls back to LD_PRELOAD
+fakeroot and the kernel sees the real uid for `mount` syscalls).
+bindroot sidesteps that by performing every mount inside a nested
+`unshare -U -m -r`, which gives the wrapper real `CAP_SYS_ADMIN` in a
+fresh user+mount namespace; when the wrapped command exits, the
+namespace dies and all mounts vanish automatically.
+
+The trade-offs are:
+* **No memory/CPU limits**: the cgroup tree is root-owned on the host
+  and apptainer-without-subuid cannot create child cgroups. Use this
+  mode only when host pressure is acceptable.
+* **No per-exec network namespace**: `/run` is read-only in the
+  apptainer rootfs, so `ip netns add` cannot persist a namespace ref.
+  Sandboxed code shares the host's net namespace.
+* **No copy-on-write for `/usr`, `/lib`, etc.**: bindroot mounts those
+  read-only. Inside apptainer they're already read-only at the kernel
+  level so this isn't a regression there.
+
+### Apptainer Backend
+
+The apptainer backend launches a local `.sif` image:
+
+```
+apptainer run --fakeroot --no-home \
+    --env PORT=<port> --env SANDBOX_CONFIG=docker_full|docker_lite \
+    [-B /var/run/docker.sock:/var/run/docker.sock -B <workdir>:<workdir>] \
+    <sif>
+```
+
+The image is resolved in this order:
+
+1. `$SANDBOX_APPTAINER_SIF` (full path to a `.sif`).
+2. `$WORK/sandbox-fusion-server_25042026-2.sif`.
+
+Pull the SIFs with:
+
+```bash
+apptainer pull docker://ineil77/sandbox-fusion-base:25042026-2
+apptainer pull docker://ineil77/sandbox-fusion-server:25042026-2
+```
+
+(or `make pull-apptainer-images`).
+
+Notes:
+* Apptainer shares the host network namespace, so the server's `PORT` env var is honored directly on the host (default `18080`, override with `SANDBOX_TEST_PORT`).
+* `full` mode still requires `/var/run/docker.sock` on the host -- the sandbox spawns sibling Docker containers for each execution. On hosts without Docker, use `--sandbox-mode lite`.
+* The apptainer process is launched in its own session; teardown sends `SIGTERM` to the process group (then `SIGKILL` after 15s). Container stdout/stderr is captured to `/tmp/sandbox_apptainer_<pid>.log`.
 
 ### Container Provisioning
 
@@ -60,8 +129,12 @@ make test-docker-lite TEST_NP=32   # more workers (if the host can handle it)
 | `make test` | Alias for `make test-docker-full` |
 | `make test-docker-full` | Full suite in Docker-in-Docker mode |
 | `make test-docker-lite` | Full suite in lite isolation mode |
-| `make test-case CASE=test_python MODE=full` | Single test with stdout visible |
-| `make test-case CASE=test_java MODE=lite` | Single test in lite mode |
+| `make test-apptainer-full` | Full suite via Apptainer, full isolation |
+| `make test-apptainer-lite` | Full suite via Apptainer, lite isolation (fails inside apptainer — see note) |
+| `make test-apptainer-bindroot` | Full suite via Apptainer, bind-mount-based isolation (the apptainer-compatible lite-equivalent) |
+| `make pull-apptainer-images` | Pull base + server SIFs from Docker Hub |
+| `make test-case CASE=test_python MODE=full` | Single test with stdout visible (docker) |
+| `make test-case CASE=test_java MODE=lite BACKEND=apptainer` | Single test via Apptainer |
 
 The `test-case` target uses `pytest -s -vv -k $(CASE)`, so `CASE` is a pytest `-k` expression -- it can be a test name, substring, or boolean expression:
 
@@ -139,7 +212,10 @@ The client is an `httpx.Client` instance pointed at `SANDBOX_TEST_SERVER_URL` (s
 | `SANDBOX_TEST_SERVER_URL` | conftest | Base URL for the test client (e.g., `http://localhost:18080`) |
 | `SANDBOX_ISOLATION_MODE` | conftest | `full` or `lite` -- used in `pytest.mark.skipif` conditions |
 | `SANDBOX_TEST_PORT` | user (optional) | Override the default test port (18080) |
-| `SANDBOX_TEST_DOCKER` | user (optional) | Alternative to `--sandbox-docker` flag |
+| `SANDBOX_TEST_MODE` | user (optional) | Alternative to `--sandbox-mode` flag (also accepts legacy `SANDBOX_TEST_DOCKER`) |
+| `SANDBOX_TEST_BACKEND` | user (optional) | Alternative to `--sandbox-backend` flag (`docker` / `apptainer`) |
+| `SANDBOX_TEST_IMAGE` | user (optional) | Override the Docker image tag (docker backend) |
+| `SANDBOX_APPTAINER_SIF` | user (optional) | Path to the server `.sif` (apptainer backend); defaults to `$WORK/sandbox-fusion-server_25042026-2.sif` |
 
 ### Skip Conditions
 
@@ -157,8 +233,9 @@ def test_external_network():
 ```
 
 Current skip conditions:
-- `test_python_fetch_files_absolute_path` -- skipped in full mode (only bind-mounts cwd, not arbitrary paths)
+- `test_python_fetch_files_absolute_path` -- skipped in full and bindroot modes (both only expose the working directory; absolute paths outside cwd are not retrievable)
 - `test_isolation_network_external_access` -- skipped in full mode (`--network none` blocks egress)
+- `test_isolation_network_server_port_conflict` -- skipped in bindroot mode (no per-exec netns; two servers on the same port genuinely conflict)
 
 ## Writing New Tests
 
@@ -340,8 +417,8 @@ This bypasses the conftest's Docker container lifecycle entirely.
 Filter by mark:
 
 ```bash
-pytest -m "minor" --sandbox-docker lite        # only minor language tests
-pytest -m "not datalake" --sandbox-docker full  # everything except datalake (default)
+pytest -m "minor" --sandbox-mode lite          # only minor language tests
+pytest -m "not datalake" --sandbox-mode full   # everything except datalake (default)
 ```
 
 ## CI Integration

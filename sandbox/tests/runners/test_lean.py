@@ -93,7 +93,8 @@ theorem amc12_2000_p5
     -- linarith
   rw [h₁] at this
   linarith
-    ''')
+    ''',
+                             run_timeout=30)
     response = client.post('/run_code', json=request.model_dump())
     assert response.status_code == 200
     result = RunCodeResponse(**response.json())

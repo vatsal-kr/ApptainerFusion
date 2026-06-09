@@ -38,7 +38,8 @@ import psutil
 import structlog
 
 from sandbox.configs.run_config import RunConfig
-from sandbox.runners.isolation import CGROUP_VERSION, tmp_cgroup, tmp_netns, tmp_overlayfs
+from sandbox.runners.isolation import (CGROUP_VERSION, OBJ_TMPDIR, build_bindroot_wrapper, tmp_bindroot,
+                                       tmp_cgroup, tmp_netns, tmp_overlayfs)
 from sandbox.runners.types import CodeRunArgs, CodeRunResult, CommandRunResult, CommandRunStatus
 from sandbox.utils.execution import get_output_non_blocking, kill_process_tree
 
@@ -191,11 +192,14 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
     """Orchestrate compile and run steps inside an isolated sandbox.
 
     Depending on the ``RunConfig.sandbox.isolation`` setting this function
-    uses one of two isolation strategies:
+    uses one of three isolation strategies:
 
     * **lite** -- overlayfs (copy-on-write root filesystem), cgroup
       (configurable memory and CPU limits), network namespace, PID
       namespace via ``unshare --pid``, and ``chroot``.
+    * **bindroot** -- same as *lite* but with a recursive bind-mount of
+      ``/`` (plus per-exec tmpfs scratch) in place of overlay.  Used
+      inside apptainer where overlay-on-rootfs is rejected by the kernel.
     * **full** -- ``docker run --rm`` with ``--memory``, ``--cpus``,
       ``--network none``, ``--pids-limit 1024``, and a bind-mount of *cwd*.
       Each container gets a unique ``sandbox_<hex>`` name for reliable
@@ -275,6 +279,68 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
 
             for filename in args.fetch_files:
                 fp = os.path.join(root, os.path.abspath(os.path.join(cwd, filename))[1:])
+                if os.path.isfile(fp):
+                    with open(fp, 'rb') as f:
+                        content = f.read()
+                    base64_content = base64.b64encode(content).decode('utf-8')
+                    files[filename] = base64_content
+            return CodeRunResult(compile_result=compile_res, run_result=run_res, files=files)
+
+    elif config.sandbox.isolation == 'bindroot':
+        # bindroot is the apptainer-compatible alternative to lite.  On
+        # hosts where the launcher lacks /etc/subuid mappings (typical
+        # HPC setup), mount syscalls require capabilities the host kernel
+        # won't grant us.  We acquire them via nested ``unshare -U -m -r``
+        # which gives the wrapper real CAP_SYS_ADMIN in a fresh
+        # user+mount namespace.  All bind mounts, the chroot, and the
+        # user command run inside that namespace; on exit, the namespace
+        # dies and every mount inside it vanishes automatically.
+        #
+        # cgroup and persistent netns setup both require host-level perms
+        # that this environment lacks (cgroup tree is root-owned;
+        # /run/netns is on an RO filesystem), so they are skipped for
+        # bindroot mode.  Per-exec isolation comes from the unshared
+        # filesystem + unique cwd path.
+        async with tmp_bindroot() as (base_dir, merged):
+            abs_cwd = os.path.abspath(cwd)
+            wrapper_script = build_bindroot_wrapper(merged, abs_cwd)
+
+            def _build_cmd(command: str) -> list:
+                # Point TMPDIR at the host-backed scratch the wrapper binds at
+                # OBJ_TMPDIR so compiler temp objects don't land on the racy
+                # tmpfs /tmp (see build_bindroot_wrapper).  OBJ_TMPDIR is not
+                # an ancestor of the cwd, so ``go test``'s go.mod handling is
+                # unaffected.
+                env_exports = f'export TMPDIR={_shell_quote(OBJ_TMPDIR)} && '
+                if extra_env:
+                    parts = [f'export {k}={_shell_quote(v)}' for k, v in extra_env.items()]
+                    env_exports += ' && '.join(parts) + ' && '
+                inner_cmd = f'{env_exports}cd {abs_cwd} && {command}'
+                # ``unshare -U -m -r`` creates a user+mount namespace and
+                # maps the caller as uid=0 (real CAP_SYS_ADMIN inside).
+                # ``bash -c <wrapper> _ <bash> <-c> <inner>`` passes the
+                # inner command through to ``chroot ... "$@"`` in the
+                # wrapper.
+                return [
+                    'unshare', '-U', '-m', '-r',
+                    'bash', '-c', wrapper_script, '_',
+                    'bash', '-c', inner_cmd,
+                ]
+
+            if compile_command is not None:
+                compile_res = await run_command_bare(
+                    _build_cmd(compile_command),
+                    args.compile_timeout, None, cwd, extra_env, True)
+            if compile_res is None or (compile_res.status == CommandRunStatus.Finished and
+                                       compile_res.return_code == 0):
+                run_res = await run_command_bare(
+                    _build_cmd(run_command),
+                    args.run_timeout, args.stdin, cwd, extra_env, True)
+
+            for filename in args.fetch_files:
+                # cwd was rbound into the chroot, so writes inside the
+                # chroot reach the host path directly.
+                fp = os.path.abspath(os.path.join(cwd, filename))
                 if os.path.isfile(fp):
                     with open(fp, 'rb') as f:
                         content = f.read()

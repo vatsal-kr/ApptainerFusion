@@ -103,8 +103,8 @@ def test_python_fetch_files():
     assert base64.b64decode(result.files['a.txt'].encode()).decode() == 'secret'
 
 @pytest.mark.skipif(
-    os.environ.get('SANDBOX_ISOLATION_MODE') == 'full',
-    reason='Full mode only bind-mounts the working directory; absolute paths outside cwd are not retrievable')
+    os.environ.get('SANDBOX_ISOLATION_MODE') in ('full', 'bindroot'),
+    reason='Full and bindroot modes only expose the working directory; absolute paths outside cwd are not retrievable')
 def test_python_fetch_files_absolute_path():
     """Files written to absolute paths should be retrievable in lite mode via overlayfs."""
     request = RunCodeRequest(language='python',

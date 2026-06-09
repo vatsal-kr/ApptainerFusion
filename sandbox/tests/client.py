@@ -2,7 +2,7 @@
 
 Tests always run against a real server over HTTP.  The server URL is
 read from ``SANDBOX_TEST_SERVER_URL`` (set automatically by conftest
-when ``--sandbox-docker`` starts the container).
+when ``--sandbox-mode`` starts the container).
 """
 
 import os
@@ -15,7 +15,8 @@ def _make_client():
     if not url:
         raise RuntimeError(
             'SANDBOX_TEST_SERVER_URL is not set. '
-            'Run tests with --sandbox-docker full or --sandbox-docker lite.')
+            'Run tests with --sandbox-mode full or --sandbox-mode lite '
+            '(optionally with --sandbox-backend docker|apptainer).')
     return httpx.Client(base_url=url, timeout=120)
 
 

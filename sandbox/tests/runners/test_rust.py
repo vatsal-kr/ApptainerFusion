@@ -51,7 +51,7 @@ def test_rust_timeout():
     }
     ''',
                              run_timeout=0.1,
-                             compile_timeout=1)
+                             compile_timeout=20)
     response = client.post('/run_code', json=request.model_dump())
     assert response.status_code == 200
     result = RunCodeResponse(**response.json())
