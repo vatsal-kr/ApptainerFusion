@@ -640,6 +640,11 @@ def build_bindroot_wrapper(merged_dir: str, cwd: str) -> str:
     tmp_scratch = os.path.join(os.path.dirname(merged_dir), 'tmproot')
     return (
         'set -e; '
+        # run_commands invokes this wrapper under ``unshare -n``, which
+        # starts with every interface (including lo) down.  Bring lo up so
+        # sandboxed code can talk to localhost; CAP_NET_ADMIN over the new
+        # netns comes with the surrounding user namespace.
+        'ip link set lo up 2>/dev/null || true; '
         # Detach this namespace's mount tree from the host's shared
         # propagation groups before laying down per-exec mounts.  ``unshare
         # -m`` copies the host mounts but leaves them as shared peers on hosts
@@ -933,6 +938,50 @@ async def tmp_netns(no_bridge: bool = False):
         except Exception:
             logger.warning('netns cleanup failed', netns=net_ns_name)
         return_subnet_ip_rfc_2322(subnet_ip)
+
+
+# ---------------------------------------------------------------------------
+# CPU core leasing (bindroot mode)
+# ---------------------------------------------------------------------------
+# bindroot mode cannot create cgroups (no host-level permissions under
+# unprivileged apptainer), so per-exec CPU containment comes from pinning
+# each execution onto its own small group of cores via ``taskset``.  The
+# pool is built lazily from this process's affinity mask, which on SLURM
+# hosts is already restricted to the job's allocation by task/affinity.
+_core_groups: Optional[List[str]] = None
+_core_groups_lock = threading.Lock()
+
+
+def _init_core_groups(cores_per_exec: int) -> List[str]:
+    """Partition this process's allowed CPUs into taskset-ready groups."""
+    cores = sorted(os.sched_getaffinity(0))
+    n = max(1, cores_per_exec)
+    groups = [','.join(str(c) for c in cores[i:i + n]) for i in range(0, len(cores) - n + 1, n)]
+    return groups or [','.join(str(c) for c in cores)]
+
+
+@asynccontextmanager
+async def tmp_cpuset(cores_per_exec: int):
+    """Lease a group of CPU cores for the duration of one execution.
+
+    Yields a taskset-compatible core list string (e.g. ``'4,5'``), or
+    ``None`` when every group is already leased out.  Callers should run
+    unpinned in that case rather than block -- the server-level
+    ``max_concurrency`` semaphore is what should keep the pool from
+    overcommitting, so exhaustion here means it is misconfigured (larger
+    than ``cores / cores_per_exec``).
+    """
+    global _core_groups
+    with _core_groups_lock:
+        if _core_groups is None:
+            _core_groups = _init_core_groups(cores_per_exec)
+        cores = _core_groups.pop() if _core_groups else None
+    try:
+        yield cores
+    finally:
+        if cores is not None:
+            with _core_groups_lock:
+                _core_groups.append(cores)
 
 
 # ---------------------------------------------------------------------------

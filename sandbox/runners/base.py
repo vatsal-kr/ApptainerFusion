@@ -39,7 +39,7 @@ import structlog
 
 from sandbox.configs.run_config import RunConfig
 from sandbox.runners.isolation import (CGROUP_VERSION, OBJ_TMPDIR, build_bindroot_wrapper, tmp_bindroot,
-                                       tmp_cgroup, tmp_netns, tmp_overlayfs)
+                                       tmp_cgroup, tmp_cpuset, tmp_netns, tmp_overlayfs)
 from sandbox.runners.types import CodeRunArgs, CodeRunResult, CommandRunResult, CommandRunStatus
 from sandbox.utils.execution import get_output_non_blocking, kill_process_tree
 
@@ -198,7 +198,10 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
       (configurable memory and CPU limits), network namespace, PID
       namespace via ``unshare --pid``, and ``chroot``.
     * **bindroot** -- same as *lite* but with a recursive bind-mount of
-      ``/`` (plus per-exec tmpfs scratch) in place of overlay.  Used
+      ``/`` (plus per-exec tmpfs scratch) in place of overlay, and
+      unprivileged stand-ins for the cgroup/netns layers: rlimits for
+      memory/CPU-seconds, ``taskset`` core leases for CPU containment,
+      and loopback-only network + PID namespaces via ``unshare``.  Used
       inside apptainer where overlay-on-rootfs is rejected by the kernel.
     * **full** -- ``docker run --rm`` with ``--memory``, ``--cpus``,
       ``--network none``, ``--pids-limit 1024``, and a bind-mount of *cwd*.
@@ -231,7 +234,9 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
         args: A :class:`CodeRunArgs` instance carrying timeouts, stdin, files,
             and the list of files to fetch after execution.
         **kwargs: Forwarded to isolation helpers.  Notable keys include
-            ``netns_no_bridge`` (bool) and ``disable_pid_isolation`` (bool).
+            ``netns_no_bridge`` (bool), ``disable_pid_isolation`` (bool),
+            and ``rlimit_as`` (bool, bindroot only) -- set False for
+            runtimes that reserve large virtual address spaces.
 
     Returns:
         A :class:`CodeRunResult` containing the compile result (if any), the
@@ -296,16 +301,32 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
         # user command run inside that namespace; on exit, the namespace
         # dies and every mount inside it vanishes automatically.
         #
-        # cgroup and persistent netns setup both require host-level perms
-        # that this environment lacks (cgroup tree is root-owned;
-        # /run/netns is on an RO filesystem), so they are skipped for
-        # bindroot mode.  Per-exec isolation comes from the unshared
-        # filesystem + unique cwd path.
-        async with tmp_bindroot() as (base_dir, merged):
+        # cgroup and persistent (bridged) netns setup both require
+        # host-level perms that this environment lacks (cgroup tree is
+        # root-owned; /run/netns is on an RO filesystem), so unprivileged
+        # stand-ins are used instead:
+        #
+        # * network -- ``unshare -n`` gives a loopback-only netns (the
+        #   wrapper brings lo up); no outbound connectivity, no bridge.
+        # * PID -- ``unshare -p --fork --mount-proc``; when the ns init
+        #   dies every descendant dies with it, so nothing survives
+        #   process-tree cleanup.
+        # * memory -- RLIMIT_AS sized from ``memory_limit_MB`` (x2 slack
+        #   because AS counts virtual memory, which mmap-heavy runtimes
+        #   inflate well past their resident usage).  Runners whose VMs
+        #   reserve address space far beyond any sane multiplier (tsx's
+        #   WASM cages, dotnet's GC regions) opt out via the
+        #   ``rlimit_as=False`` kwarg; they keep the RLIMIT_CPU backstop.
+        # * CPU -- ``taskset`` pinning onto a leased core group caps how
+        #   many cores one exec can occupy, and RLIMIT_CPU backstops the
+        #   wall-clock timeout against runaway spinners.
+        mem_limit_mb = args.memory_limit_MB if args.memory_limit_MB > 0 else config.sandbox.default_memory_limit_mb
+        cores_per_exec = max(1, int(config.sandbox.default_cpu_limit))
+        async with tmp_bindroot() as (base_dir, merged), tmp_cpuset(cores_per_exec) as pinned_cores:
             abs_cwd = os.path.abspath(cwd)
             wrapper_script = build_bindroot_wrapper(merged, abs_cwd)
 
-            def _build_cmd(command: str) -> list:
+            def _build_cmd(command: str, timeout: float) -> list:
                 # Point TMPDIR at the host-backed scratch the wrapper binds at
                 # OBJ_TMPDIR so compiler temp objects don't land on the racy
                 # tmpfs /tmp (see build_bindroot_wrapper).  OBJ_TMPDIR is not
@@ -315,26 +336,38 @@ async def run_commands(compile_command: Optional[str], run_command: str, cwd: st
                 if extra_env:
                     parts = [f'export {k}={_shell_quote(v)}' for k, v in extra_env.items()]
                     env_exports += ' && '.join(parts) + ' && '
-                inner_cmd = f'{env_exports}cd {abs_cwd} && {command}'
+                # ulimit -v is in KiB.  -t (CPU seconds) gets 2x the wall
+                # timeout + 1 so it only fires on processes that escaped the
+                # wall-clock kill, and multi-threaded execs on a 2-core lease
+                # aren't penalized.
+                rlimits = f'ulimit -t {int(timeout) * 2 + 1}; '
+                if kwargs.get('rlimit_as', True):
+                    rlimits += f'ulimit -v {int(mem_limit_mb) * 2 * 1024}; '
+                inner_cmd = f'{rlimits}{env_exports}cd {abs_cwd} && {command}'
                 # ``unshare -U -m -r`` creates a user+mount namespace and
-                # maps the caller as uid=0 (real CAP_SYS_ADMIN inside).
+                # maps the caller as uid=0 (real CAP_SYS_ADMIN inside);
+                # ``-n`` and ``-p --fork --mount-proc`` add the network and
+                # PID namespaces described above.
                 # ``bash -c <wrapper> _ <bash> <-c> <inner>`` passes the
                 # inner command through to ``chroot ... "$@"`` in the
                 # wrapper.
-                return [
-                    'unshare', '-U', '-m', '-r',
+                cmd = [
+                    'unshare', '-U', '-m', '-r', '-n', '-p', '--fork', '--mount-proc',
                     'bash', '-c', wrapper_script, '_',
                     'bash', '-c', inner_cmd,
                 ]
+                if pinned_cores is not None:
+                    cmd = ['taskset', '-c', pinned_cores] + cmd
+                return cmd
 
             if compile_command is not None:
                 compile_res = await run_command_bare(
-                    _build_cmd(compile_command),
+                    _build_cmd(compile_command, args.compile_timeout),
                     args.compile_timeout, None, cwd, extra_env, True)
             if compile_res is None or (compile_res.status == CommandRunStatus.Finished and
                                        compile_res.return_code == 0):
                 run_res = await run_command_bare(
-                    _build_cmd(run_command),
+                    _build_cmd(run_command, args.run_timeout),
                     args.run_timeout, args.stdin, cwd, extra_env, True)
 
             for filename in args.fetch_files:

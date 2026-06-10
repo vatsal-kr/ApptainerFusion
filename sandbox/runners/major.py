@@ -221,7 +221,9 @@ async def run_csharp(args: CodeRunArgs) -> CodeRunResult:
         with open(cs_file_path, 'w') as cs_file:
             cs_file.write(args.code)
 
-        return await run_commands(None, f'dotnet run --project {tmp_dir}', tmp_dir, {}, args)
+        # rlimit_as=False: the .NET GC reserves address-space regions sized
+        # from visible machine resources, which trips RLIMIT_AS under load.
+        return await run_commands(None, f'dotnet run --project {tmp_dir}', tmp_dir, {}, args, rlimit_as=False)
 
 
 async def run_go_test(args: CodeRunArgs) -> CodeRunResult:
@@ -309,7 +311,9 @@ async def run_typescript(args: CodeRunArgs) -> CodeRunResult:
         with tempfile.NamedTemporaryFile(mode='w', dir=tmp_dir, suffix='.ts', delete=False) as f:
             f.write(args.code)
 
-        return await run_commands(None, f'tsx {f.name}', tmp_dir, {}, args)
+        # rlimit_as=False: tsx instantiates a WASM transform pipeline whose
+        # memory cages need more address space than RLIMIT_AS can sanely allow.
+        return await run_commands(None, f'tsx {f.name}', tmp_dir, {}, args, rlimit_as=False)
 
 
 async def run_jest(args: CodeRunArgs) -> CodeRunResult:

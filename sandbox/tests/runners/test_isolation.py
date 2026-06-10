@@ -192,10 +192,6 @@ def test_isolation_network_server_localhost():
     assert result.status == RunStatus.Success
     assert 'Test Passed' in result.run_result.stdout
 
-@pytest.mark.skipif(
-    os.environ.get('SANDBOX_ISOLATION_MODE') == 'bindroot',
-    reason='Bindroot mode shares the host network namespace, so two servers '
-           'on the same port genuinely conflict (no per-exec netns).')
 async def test_isolation_network_server_port_conflict():
     """Verify that two concurrent servers on the same port do not conflict.
 
@@ -220,8 +216,9 @@ async def test_isolation_network_server_port_conflict():
         assert 'Test Passed' in result.run_result.stdout
 
 @pytest.mark.skipif(
-    os.environ.get('SANDBOX_ISOLATION_MODE') == 'full',
-    reason='Full mode uses --network none which blocks all egress traffic')
+    os.environ.get('SANDBOX_ISOLATION_MODE') in ('full', 'bindroot'),
+    reason='Full mode uses --network none and bindroot uses a loopback-only '
+           'netns (unshare -n); both block egress traffic by design')
 def test_isolation_network_external_access():
     """Verify that sandboxed code can make outbound HTTP requests to external hosts.
 
@@ -235,3 +232,22 @@ def test_isolation_network_external_access():
     result = RunCodeResponse(**response.json())
     print(result.model_dump_json(indent=2))
     assert result.status == RunStatus.Success
+
+
+@pytest.mark.skipif(
+    os.environ.get('SANDBOX_ISOLATION_MODE') not in ('full', 'bindroot'),
+    reason='Lite mode provides NAT bridging, so egress is allowed there')
+def test_isolation_network_external_blocked():
+    """Verify that sandboxed code can NOT reach external hosts.
+
+    Full mode blocks egress via ``--network none``; bindroot blocks it via a
+    loopback-only network namespace.  NET_1 raises when every endpoint is
+    unreachable, so the run must finish with a non-zero exit code.
+    """
+    request = RunCodeRequest(language='python', code=NET_1, run_timeout=60)
+    response = client.post('/run_code', json=request.model_dump())
+    assert response.status_code == 200
+    result = RunCodeResponse(**response.json())
+    print(result.model_dump_json(indent=2))
+    assert result.status == RunStatus.Failed
+    assert 'All endpoints failed' in result.run_result.stderr
