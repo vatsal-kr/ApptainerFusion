@@ -109,27 +109,43 @@ For each code execution the server:
    inside the chroot land directly on the host path, so `fetch_files` works
    without copying back out.
 
-### What `bindroot` deliberately omits vs `lite`
+### Resource and network isolation: unprivileged stand-ins for cgroups/netns
 
-- **No cgroup memory/cpu limits.** The cgroup tree is root-owned and not
-  delegated to the unprivileged user on HPC hosts, so `tmp_cgroup` is skipped.
-- **No persistent network namespace.** `/run/netns` sits on a read-only
-  filesystem under Apptainer, so `tmp_netns` is skipped. (The recursive bind of
-  `/` still gives the sandbox a working resolver via the host's `/etc/*`.)
+`lite` mode's resource isolation relies on primitives an unprivileged Apptainer
+user does not have: the cgroup tree is root-owned and not delegated
+(`tmp_cgroup` impossible), and `/run/netns` sits on a read-only filesystem
+(`tmp_netns` impossible). The initial migration simply skipped both — sandboxed
+code ran with unlimited memory/CPU and full network access, and the resulting
+free-for-all contention caused several of the test flakes in §5. A later
+hardening pass replaced each skipped layer with an unprivileged equivalent:
 
-Per-exec isolation therefore comes purely from the unshared filesystem + unique
-cwd path, not from resource cgroups. This lack of resource isolation is the
-source of several of the test issues in §5 (under load, neighbours that Docker
-would have capped instead contend freely).
+- **Memory:** `ulimit -v` sized from `memory_limit_MB` (×2 slack for virtual
+  address space). Runtimes that reserve VAS far beyond any sane multiplier opt
+  out via `run_commands(rlimit_as=False)` — tsx's WASM cages (typescript) and
+  the .NET GC (csharp) — keeping only the `RLIMIT_CPU` backstop.
+- **CPU:** `taskset` pinning onto per-exec core groups leased from the affinity
+  mask (`tmp_cpuset`), plus `ulimit -t` as a runaway-spinner backstop.
+  `max_concurrency` is sized to cores / `default_cpu_limit` (32 on a 64-core
+  allocation at 2 cores/exec — see `docker_bindroot.yaml`).
+- **Network:** `unshare -n` gives each exec a loopback-only namespace; the
+  wrapper brings `lo` up so localhost servers still work. Egress is blocked by
+  design (the egress test skips under bindroot; a companion test asserts the
+  block actually holds).
+- **PID:** `unshare -p --fork --mount-proc`, so no process survives the death
+  of the namespace's init.
 
 ---
 
 ## 4. Launch / harness changes
 
-- **`Makefile`**: new `pull-apptainer-images`, `start-apptainer-container`, and
-  `test-apptainer-bindroot` targets. The standalone launcher binds the host
-  `sandbox/` over the SIF's copy (`-B $(CURDIR)/sandbox:/root/sandbox/sandbox`)
-  so local code edits are picked up without rebuilding the SIF.
+- **`Makefile`**: new `pull-apptainer-images`, `start-apptainer-container`,
+  `test-apptainer-bindroot`, and `test-rl-load` targets. The standalone launcher
+  binds the host `sandbox/` over the SIF's copy
+  (`-B $(CURDIR)/sandbox:/root/sandbox/sandbox`) so local code edits are picked
+  up without rebuilding the SIF. It runs with
+  `--cleanenv --fakeroot --ignore-fakeroot-command --no-home` (see §6.1 for why
+  that exact flag combination) and `SANDBOX_LOG_LEVEL=OFF` (server log level is
+  configurable via that env var; default `INFO`).
 - **`conftest.py`**: `--sandbox-backend {docker,apptainer}` and `--sandbox-mode
   {full,lite,bindroot}` options; an Apptainer server launcher
   (`_start_apptainer_server`) that resolves the SIF from `$SANDBOX_APPTAINER_SIF`
@@ -146,7 +162,7 @@ would have capped instead contend freely).
 ## 5. Fixes required to pass the test suite under Apptainer
 
 `make test-apptainer-bindroot` initially had 11 failures that did not occur
-under Docker. Four independent root causes; all now green (212 passed,
+under Docker. Four independent root causes; all now green (213 passed,
 2 skipped).
 
 ### 5.1 Host conda environment leaked into the SIF — `--cleanenv`
@@ -242,16 +258,79 @@ propagating in and shadowing this sandbox's `/tmp` mid-build.
 
 ---
 
-## 6. Summary of changed files
+## 6. Production hardening under sustained RL load
+
+The test suite passes in minutes; an RL training run hammers the server for
+hours with ~48 concurrent streams of adversarial, model-generated code. Two
+server-wedging bugs only surfaced under that regime — both manifested as the
+training client's read timeouts ramping up over a few RL steps until every
+reward was zero, while the server still answered `/v1/ping` (and even trivial
+`/run_code` probes) normally.
+
+### 6.1 `faked` daemon corruption — `--ignore-fakeroot-command`
+
+`--fakeroot` is required: the SIF bakes every language toolchain's state into
+`/root` (rustup/elan/go/dotnet caches), so the server must appear as uid 0 with
+`HOME=/root` — without it, 18 language tests fail with "could not create home
+directory". But on hosts without `/etc/subuid` entries, `--fakeroot` *also*
+wraps the container in the `fakeroot` LD_PRELOAD tool, whose single `faked`
+daemon serializes all metadata faking over one SysV IPC channel. Under
+sustained concurrent process spawning the daemon corrupts its protocol
+(`libfakeroot internal error: payload not recognized!`), after which **every
+new process in the container hangs** — the whole server wedges.
+
+**Fix:** add `--ignore-fakeroot-command` alongside `--fakeroot`. This keeps the
+root-mapped user namespace (uid 0, `HOME=/root`) but skips the LD_PRELOAD
+wrapper entirely. The flag is meaningless without `--fakeroot`; the two must be
+used together. Applied in the Makefile launcher and the `conftest.py` test
+fixture.
+
+### 6.2 stdin-drain concurrency-slot leak
+
+In `run_command_bare` (`sandbox/runners/base.py`), stdin was written to the
+child with an unbounded `await p.stdin.drain()` *before* the wall-clock
+`wait_for(p.wait(), timeout)` was armed. A child that stays alive without
+consuming a stdin larger than the 64 KiB pipe buffer blocks `drain()` forever:
+the handler never reaches the kill, never returns, and **permanently leaks its
+`max_concurrency` semaphore slot**. Each occurrence shrinks effective capacity
+by one; the process burns no CPU, so `ulimit -t` never fires, and trivial
+health probes keep succeeding through the remaining free slots — which is why
+liveness watchdogs stayed silent while training rewards collapsed.
+
+**Fix:** bound the stdin flush with the run timeout and charge its elapsed time
+against the subsequent `p.wait()` window, so a poisoned stdin yields a normal
+`TimeLimitExceeded` instead of a leaked slot.
+
+### 6.3 RL-load regression suite — `make test-rl-load`
+
+`sandbox/tests/test_rl_load.py` (marker: `stress`, excluded from the default
+run) replays the training access pattern against a live server so these
+regressions are caught without submitting GPU jobs:
+
+- **storm**: 288 requests over 48 concurrent client streams of mixed
+  workloads (fast, CPU-heavy, TLE, compile-error, big-output, poison-stdin)
+  with a background liveness prober; zero client timeouts allowed.
+- **poison-stdin slot leak**: 12 concurrent sleepers fed 1 MiB of stdin must
+  all return `TimeLimitExceeded` (the pre-fix server fails this in seconds).
+- **kill churn**: 3 waves × 32 infinite loops, exercising timeout-kill paths
+  at full concurrency.
+
+---
+
+## 7. Summary of changed files
 
 | File | Change |
 |------|--------|
 | `sandbox/configs/run_config.py` | add `bindroot` to the `isolation` literal |
 | `sandbox/configs/docker_bindroot.yaml` | new server config (`isolation: bindroot`) |
-| `sandbox/runners/isolation.py` | `tmp_bindroot`, `build_bindroot_wrapper`, `OBJ_TMPDIR` host-backed compiler scratch, `--make-rprivate` hygiene, orphan/signal cleanup for bindroot dirs |
-| `sandbox/runners/base.py` | `run_commands` bindroot branch; `_build_cmd` exports `TMPDIR=$OBJ_TMPDIR` |
-| `conftest.py` | `--sandbox-backend`/`--sandbox-mode`; Apptainer server launcher; `--cleanenv` |
-| `Makefile` | `pull-apptainer-images`, `start-apptainer-container`, `test-apptainer-bindroot`; `--cleanenv` |
+| `sandbox/runners/isolation.py` | `tmp_bindroot`, `build_bindroot_wrapper`, `OBJ_TMPDIR` host-backed compiler scratch, `--make-rprivate` hygiene, orphan/signal cleanup for bindroot dirs; `tmp_cpuset` per-exec core leasing |
+| `sandbox/runners/base.py` | `run_commands` bindroot branch; `_build_cmd` exports `TMPDIR=$OBJ_TMPDIR`; rlimit/taskset/netns/PID-ns stand-ins (§3); stdin-drain timeout fix (§6.2) |
+| `sandbox/runners/major.py` | `rlimit_as=False` opt-outs for tsx/.NET |
+| `conftest.py` | `--sandbox-backend`/`--sandbox-mode`; Apptainer server launcher; `--cleanenv --fakeroot --ignore-fakeroot-command --no-home` |
+| `Makefile` | `pull-apptainer-images`, `start-apptainer-container`, `test-apptainer-bindroot`, `test-rl-load`; launch flags as above |
+| `sandbox/utils/logging.py` | server log level configurable via `SANDBOX_LOG_LEVEL` |
+| `sandbox/tests/test_rl_load.py` | RL-load regression suite (§6.3), `stress` marker |
+| `sandbox/tests/runners/test_isolation.py` | egress test skipped under bindroot + egress-blocked assertion; port-conflict test un-skipped (per-exec netns) |
 | `sandbox/tests/runners/test_lean.py` | `test_lean_error` run timeout 10 → 30 |
 | `sandbox/tests/runners/test_rust.py` | `test_rust_timeout` compile timeout 1 → 20 |
 | `sandbox/tests/runners/test_python.py` | skip absolute-path fetch test under `bindroot` (only the cwd is exposed, like `full`) |
