@@ -36,6 +36,7 @@ start-apptainer-container:
 		--env PORT=$(PORT) \
 		--env SANDBOX_CONFIG=docker_bindroot \
 		--env SANDBOX_LOG_LEVEL=OFF \
+		--env SANDBOX_MAX_CONCURRENCY=$(SANDBOX_MAX_CONCURRENCY) \
 		-B $(CURDIR)/sandbox:/root/sandbox/sandbox \
 		"$$WORK/sandbox-fusion-server_$(IMAGE_TAG).sif"
 

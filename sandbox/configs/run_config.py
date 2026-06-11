@@ -126,6 +126,12 @@ class RunConfig(BaseModel):
             os.path.join(os.path.dirname(__file__), f'{os.getenv("SANDBOX_CONFIG", "local")}.yaml'))
         with open(config_path) as f:
             data = yaml.safe_load(f)
+        # SANDBOX_MAX_CONCURRENCY overrides sandbox.max_concurrency so one
+        # yaml serves allocations of different core counts.  Keep it
+        # <= cores / default_cpu_limit, or overflow execs run unpinned.
+        max_concurrency = os.getenv("SANDBOX_MAX_CONCURRENCY")
+        if max_concurrency:
+            data["sandbox"]["max_concurrency"] = int(max_concurrency)
         super().__init__(**data)
 
     # singleton logic
