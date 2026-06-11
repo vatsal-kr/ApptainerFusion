@@ -64,6 +64,7 @@ filterwarnings = [
 markers = [
     "minor: tests of minor languages",
     "datalake: tests that requires online datalake access",
+    "stress: RL-loop load tests against a live server; run via make test-rl-load",
 ]
 
 [tool.coverage.run]

@@ -125,13 +125,22 @@ async def run_command_bare(command: str | List[str],
                                                       executable='/bin/bash',
                                                       env=env,
                                                       preexec_fn=preexec_fn)
+        start_time = time.time()
+        timed_out = False
         if stdin is not None:
             try:
                 if p.stdin:
                     p.stdin.write(stdin.encode())
-                    await p.stdin.drain()
+                    # Bound the flush with the run timeout: a child that stays
+                    # alive without consuming a stdin larger than the 64 KiB
+                    # pipe buffer would otherwise block drain() forever --
+                    # before the wall-clock kill below is even armed -- leaking
+                    # the execution process and its concurrency slot.
+                    await asyncio.wait_for(p.stdin.drain(), timeout=timeout)
                 else:
                     logger.warning("Attempted to write to stdin, but stdin is closed.")
+            except asyncio.TimeoutError:
+                timed_out = True
             except Exception as e:
                 logger.exception(f"Failed to write to stdin: {e}")
         if p.stdin:
@@ -140,12 +149,12 @@ async def run_command_bare(command: str | List[str],
             except Exception as e:
                 logger.warning(f"Failed to close stdin: {e}")
 
-        start_time = time.time()
-        timed_out = False
-        try:
-            await asyncio.wait_for(p.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            timed_out = True
+        if not timed_out:
+            remaining = max(0.0, timeout - (time.time() - start_time))
+            try:
+                await asyncio.wait_for(p.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
 
         execution_time = time.time() - start_time
 

@@ -240,7 +240,16 @@ def _start_apptainer_server(mode: str):
     # in the host conda env and not in the SIF, so those compiles fail.
     # Docker starts from a clean env and is unaffected; --cleanenv makes
     # apptainer match that.  PORT/SANDBOX_CONFIG are re-injected via --env.
-    cmd = ['apptainer', 'run', '--cleanenv', '--fakeroot', '--no-home']
+    # --fakeroot is required: the SIF bakes every language toolchain's state
+    # into /root (rustup/elan/go/dotnet caches), so the server must appear
+    # as uid 0 with HOME=/root; without it 18 language tests fail with
+    # "could not create home directory".  --ignore-fakeroot-command keeps
+    # that root-mapped user namespace but skips wrapping the container in
+    # the `fakeroot` LD_PRELOAD tool, whose single `faked` daemon corrupts
+    # its SysV IPC protocol under sustained concurrent process spawning
+    # ("libfakeroot internal error: payload not recognized!") and then
+    # every new process in the container hangs, wedging the server.
+    cmd = ['apptainer', 'run', '--cleanenv', '--fakeroot', '--ignore-fakeroot-command', '--no-home']
     # The server reads PORT from its env (see scripts/run.sh). Apptainer
     # shares the host network namespace, so this binds on the host port.
     cmd += ['--env', f'PORT={port}']

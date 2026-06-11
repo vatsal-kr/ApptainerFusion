@@ -32,7 +32,7 @@ pull-apptainer-images:
 # code is picked up without rebuilding the image.  Drop the -B once the SIF
 # has been rebuilt with the new sources.
 start-apptainer-container:
-	apptainer run --cleanenv --fakeroot --no-home \
+	apptainer run --cleanenv --fakeroot --ignore-fakeroot-command --no-home \
 		--env PORT=$(PORT) \
 		--env SANDBOX_CONFIG=docker_bindroot \
 		--env SANDBOX_LOG_LEVEL=OFF \
@@ -42,13 +42,19 @@ start-apptainer-container:
 test: test-docker-full
 
 test-docker-full:
-	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode full
+	pytest -m "not datalake and not stress" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode full
 
 test-docker-lite:
-	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode lite
+	pytest -m "not datalake and not stress" -n $(TEST_NP) --sandbox-backend docker --sandbox-mode lite
 
 test-apptainer-bindroot:
-	pytest -m "not datalake" -n $(TEST_NP) --sandbox-backend apptainer --sandbox-mode bindroot
+	pytest -m "not datalake and not stress" -n $(TEST_NP) --sandbox-backend apptainer --sandbox-mode bindroot
+
+# Replays an RL reward loop against the server (48 concurrent clients, mixed
+# correct/TLE/poison-stdin solutions).  Runs sequentially: the tests manage
+# their own concurrency.
+test-rl-load:
+	pytest -s -m stress --sandbox-backend apptainer --sandbox-mode bindroot sandbox/tests/test_rl_load.py
 
 test-case:
 	pytest -s -vv -k $(CASE) --sandbox-backend $(BACKEND) --sandbox-mode $(MODE)
